@@ -1,4 +1,6 @@
 import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 import sys
 import time, logging
 from datetime import datetime
@@ -14,9 +16,8 @@ import colorful as cf
 import requests
 from pathlib import Path
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-
 logging.basicConfig(level=logging.INFO)
+#logging.basicConfig(level=logging.DEBUG)
 
 class Audio(object):
     """Streams raw audio from microphone. Data is received in a separate thread, and stored in a buffer, to be read from."""
@@ -39,7 +40,7 @@ class Audio(object):
         self.block_size = int(self.RATE_PROCESS / float(self.BLOCKS_PER_SECOND))
         self.block_size_input = int(self.input_rate / float(self.BLOCKS_PER_SECOND))
         self.pa = pyaudio.PyAudio()
-
+        
         kwargs = {
             'format': self.FORMAT,
             'channels': self.CHANNELS,
@@ -52,6 +53,8 @@ class Audio(object):
         # if not default device
         if self.device:
             kwargs['input_device_index'] = self.device
+
+        logging.debug('PA kwargs' + str(kwargs))
 
         self.stream = self.pa.open(**kwargs)
         self.stream.start_stream()
@@ -89,6 +92,7 @@ class Audio(object):
 
     def restart(self):
         """Restart the stream listening (when previously paused)."""
+        time.sleep(0.5)
         self.stream.start_stream()
 
     def destroy(self):
@@ -126,7 +130,7 @@ class VADAudio(Audio):
             while True:
                 yield self.read_resampled()
 
-    def vad_collector(self, padding_ms=400, ratio=0.75, frames=None):
+    def vad_collector(self, padding_ms=300, ratio=0.75, frames=None):
         """Generator that yields series of consecutive audio frames comprising each utterence, separated by yielding a single None.
             Determines voice activity by ratio of frames in padding_ms. Uses a buffer to include padding_ms prior to being triggered.
             Example: (frame, ..., frame, None, frame, ..., frame, None, ...)
@@ -138,6 +142,9 @@ class VADAudio(Audio):
         triggered = False
 
         for frame in frames:
+            if len(frame) < 640:
+                return
+
             is_speech = self.vad.is_speech(frame, self.sample_rate)
 
             if not triggered:
@@ -201,8 +208,8 @@ def check_input(input_text, vad_audio):
     vad_audio.pause()
     if input_text.lower() == 'stop':
         exit_app()
-    elif input_text.lower().startswith('make a robot noise'):
-        play_wav('robot_noise.wav')
+    #elif input_text.lower().startswith('make a robot noise'):
+    #    play_wav('robot_noise.wav')
     elif input_text.lower().startswith('tell me about'):
         read_wikipedia(input_text)
 
@@ -237,15 +244,16 @@ def echo_line(input_text, print_output = True):
         #say_text = 'I heard, ' + input_text
         if len(input_text) <= 2:
             input_text = 'error with text length'
-        say_text = input_text
-        url = 'http://0.0.0.0:5002/api/tts?text={}'.format(say_text)
-        r = requests.get(url)
-        with open(filename, 'wb') as f:
-            f.write(r.content)
-        logging.debug('saved wav for {}'.format(url))
-        #p = pyaudio.PyAudio()
-        #play_wav(filename, p)
-        play_wav(filename)
+        else:
+            say_text = input_text
+            url = 'http://0.0.0.0:5002/api/tts?text={}'.format(say_text)
+            r = requests.get(url)
+            with open(filename, 'wb') as f:
+                f.write(r.content)
+            logging.debug('saved wav for {}'.format(url))
+            #p = pyaudio.PyAudio()
+            #play_wav(filename, p)
+            play_wav(filename)
         #p.terminate()
     if print_output: print(cf.slateGray("Recognized: {0}".format(cf.bold_white(input_text))))
     return
@@ -262,31 +270,22 @@ def match_line(input_text):
 def main(ARGS):
 
     #p = pyaudio.PyAudio()
-    play_wav('robot_noise.wav')
+    #play_wav('robot_noise.wav')
     #p.terminate()
 
 
     # Load DeepSpeech model
     if os.path.isdir(ARGS.model):
         model_dir = ARGS.model
-        ARGS.model = os.path.join(model_dir, 'output_graph.pbmm')
-        if not Path(ARGS.model).is_file():
-            ARGS.model = os.path.join(model_dir, 'output_graph.pb')
-        ARGS.alphabet = os.path.join(model_dir, ARGS.alphabet if ARGS.alphabet else 'alphabet.txt')
-        ARGS.lm = os.path.join(model_dir, ARGS.lm)
-        ARGS.trie = os.path.join(model_dir, ARGS.trie)
+        ARGS.model = os.path.join(model_dir, 'output_graph.pb')
+        ARGS.scorer = os.path.join(model_dir, ARGS.scorer)
 
     print(cf.bold_coral('Initializing model...'))
     logging.info("ARGS.model: %s", ARGS.model)
-    logging.info("ARGS.alphabet: %s", ARGS.alphabet)
-    logging.info("ARGS.beam_width: %s", ARGS.beam_width)
-    model = deepspeech.Model(ARGS.model, ARGS.n_features, ARGS.n_context, ARGS.alphabet, ARGS.beam_width)
-    if ARGS.lm and ARGS.trie:
-        logging.info("ARGS.lm: %s", ARGS.lm)
-        logging.info("ARGS.trie: %s", ARGS.trie)
-        logging.info("ARGS.lm_alpha: %s", ARGS.lm_alpha)
-        logging.info("ARGS.lm_beta: %s", ARGS.lm_beta)
-        model.enableDecoderWithLM(ARGS.alphabet, ARGS.lm, ARGS.trie, ARGS.lm_alpha, ARGS.lm_beta)
+    model = deepspeech.Model(ARGS.model)
+    if ARGS.scorer:
+        logging.info("ARGS.scorer: %s", ARGS.scorer)
+        model.enableExternalScorer(ARGS.scorer)
 
     # Start audio with VAD
     vad_audio = VADAudio(aggressiveness=ARGS.vad_aggressiveness,
@@ -297,14 +296,16 @@ def main(ARGS):
 
     # Stream from microphone to DeepSpeech using VAD
     spinner = None
-    if not ARGS.nospinner: spinner = Halo(spinner='line')
-    stream_context = model.setupStream()
+    if not ARGS.nospinner:
+        spinner = Halo(spinner='line')
+    stream_context = model.createStream()
     wav_data = bytearray()
     for frame in frames:
         if frame is not None:
             if spinner: spinner.start()
             logging.debug("streaming frame")
-            model.feedAudioContent(stream_context, np.frombuffer(frame, np.int16))
+            stream_context.feedAudioContent(np.frombuffer(frame, np.int16))
+            #model.feedAudioContent(stream_context, np.frombuffer(frame, np.int16))
             if ARGS.savewav: wav_data.extend(frame)
         else:
             if spinner: spinner.stop()
@@ -312,21 +313,17 @@ def main(ARGS):
             if ARGS.savewav:
                 vad_audio.write_wav(os.path.join(ARGS.savewav, datetime.now().strftime("savewav_%Y-%m-%d_%H-%M-%S_%f.wav")), wav_data)
                 wav_data = bytearray()
-            text = model.finishStream(stream_context)
+            text = stream_context.finishStream()
+            #text = model.finishStream(stream_context)
             check_input(text, vad_audio)
             #print(cf.slateGray("Recognized: {0}".format(cf.bold_white(text))))
-            stream_context = model.setupStream()
+            stream_context = model.createStream()
 
 if __name__ == '__main__':
-    BEAM_WIDTH = 1000 # changed from 500
     DEFAULT_SAMPLE_RATE = 16000
-    LM_ALPHA = 0.75
-    LM_BETA = 1.85
-    N_FEATURES = 26
-    N_CONTEXT = 9
 
     import argparse
-    parser = argparse.ArgumentParser(description="Stream from microphone to DeepSpeech using VAD")
+    parser = argparse.ArgumentParser(description="Stream from microphone to DeepSpeech using VAD and then on to TTS")
 
     parser.add_argument('-v', '--vad_aggressiveness', type=int, default=2,
         help="Set aggressiveness of VAD: an integer between 0 and 3, 0 being the least aggressive about filtering out non-speech, 3 the most aggressive. Default: 2")
@@ -337,26 +334,12 @@ if __name__ == '__main__':
 
     parser.add_argument('-m', '--model', required=True,
                         help="Path to the model (protocol buffer binary file, or entire directory containing all standard-named files for model)")
-    parser.add_argument('-a', '--alphabet', default='alphabet.txt',
-                        help="Path to the configuration file specifying the alphabet used by the network. Default: alphabet.txt")
-    parser.add_argument('-l', '--lm', default='lm.binary',
-                        help="Path to the language model binary file. Default: lm.binary")
-    parser.add_argument('-t', '--trie', default='trie',
-                        help="Path to the language model trie file created with native_client/generate_trie. Default: trie")
+    parser.add_argument('-s', '--scorer',
+                        help="Path to the external scorer file.")
     parser.add_argument('-d', '--device', type=int, default=None,
                         help="Device input index (Int) as listed by pyaudio.PyAudio.get_device_info_by_index(). If not provided, falls back to PyAudio.get_default_device()")
     parser.add_argument('-r', '--rate', type=int, default=DEFAULT_SAMPLE_RATE,
                         help=f"Input device sample rate. Default: {DEFAULT_SAMPLE_RATE}. Your device may require 44100.")
-    parser.add_argument('-nf', '--n_features', type=int, default=N_FEATURES,
-                        help=f"Number of MFCC features to use. Default: {N_FEATURES}")
-    parser.add_argument('-nc', '--n_context', type=int, default=N_CONTEXT,
-                        help=f"Size of the context window used for producing timesteps in the input vector. Default: {N_CONTEXT}")
-    parser.add_argument('-la', '--lm_alpha', type=float, default=LM_ALPHA,
-                        help=f"The alpha hyperparameter of the CTC decoder. Language Model weight. Default: {LM_ALPHA}")
-    parser.add_argument('-lb', '--lm_beta', type=float, default=LM_BETA,
-                        help=f"The beta hyperparameter of the CTC decoder. Word insertion bonus. Default: {LM_BETA}")
-    parser.add_argument('-bw', '--beam_width', type=int, default=BEAM_WIDTH,
-                        help=f"Beam width used in the CTC decoder when building candidate transcriptions. Default: {BEAM_WIDTH}")
 
     ARGS = parser.parse_args()
     if ARGS.savewav: os.makedirs(ARGS.savewav, exist_ok=True)
